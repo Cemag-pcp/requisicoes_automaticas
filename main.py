@@ -433,6 +433,9 @@ def inserir_requisicao(page: Page, rec: dict) -> str:
     sim.wait_for(state="visible", timeout=8000)
     sim.click()
 
+    # Aguarda o dialog de confirmação fechar antes de buscar o modal de resultado
+    page.wait_for_selector('[role="dialog"]', state="hidden", timeout=10000)
+
     # Aguarda modal de resultado (sucesso ou erro)
     page.wait_for_selector('[role="dialog"]', timeout=15000)
     _verificar_e_fechar_modal_pos_gravar(page)
@@ -465,6 +468,7 @@ def _verificar_e_fechar_modal_pos_gravar(page: Page):
         texto = dialog.inner_text().strip()
     except Exception:
         pass
+    log.info(f"  → Texto do modal pós-gravar: '{texto}'")
 
     try:
         btn = dialog.get_by_role("button", name="Fechar")
@@ -476,8 +480,8 @@ def _verificar_e_fechar_modal_pos_gravar(page: Page):
     except Exception:
         pass
 
-    palavras_sucesso = ["sucesso", "gravad", "aprovad", "concluíd", "realiz", "ok"]
-    if not any(p in texto.lower() for p in palavras_sucesso):
+    palavras_erro = ["erro", "falha", "não foi", "nao foi", "impossível", "impossivel", "inválid", "invalido"]
+    if any(p in texto.lower() for p in palavras_erro):
         raise RuntimeError(f"ERP retornou erro após gravar: {texto}")
 
 
@@ -485,9 +489,25 @@ def _verificar_e_fechar_modal_pos_gravar(page: Page):
 # Loop principal
 # ---------------------------------------------------------------------------
 
+MOCK_TEST = 0
+MOCK_REC = {
+    "id": 0,
+    "item": "700017",
+    "quantidade": 1,
+    "classe_req": "Req p Consumo",
+    "matricula": "4357",
+    "cc": "2310",
+    "chave_innovaro": None,
+}
+
+
 def ciclo(page: Page, conn):
     """Busca pendentes e processa um a um."""
-    pendentes = buscar_pendentes(conn)
+    if MOCK_TEST:
+        pendentes = [MOCK_REC]
+        log.info("MOCK_TEST ativo — usando registro de teste.")
+    else:
+        pendentes = buscar_pendentes(conn)
     if not pendentes:
         log.info("Nenhum registro pendente.")
         return
@@ -499,12 +519,14 @@ def ciclo(page: Page, conn):
         log.info(f"Processando id={sr_id} | recurso={rec['item']}")
         try:
             chave = inserir_requisicao(page, rec)
-            marcar_ok(conn, sr_id, chave)
+            if not MOCK_TEST:
+                marcar_ok(conn, sr_id, chave)
             log.info(f"  ✓ id={sr_id} gravado com chave={chave}")
         except Exception as exc:
             log.error(f"  ✗ Erro no id={sr_id}: {exc}", exc_info=True)
             capturar_screenshot(page, f"erro_id{sr_id}")
-            marcar_erro(conn, sr_id, str(exc))
+            if not MOCK_TEST:
+                marcar_erro(conn, sr_id, str(exc))
         finally:
             # Sempre fechar a aba e reabrir pelo menu, independente do que aconteceu
             try:
