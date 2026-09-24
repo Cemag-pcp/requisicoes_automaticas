@@ -85,11 +85,14 @@ echo Setup concluido com sucesso.
 if not exist ".env" (
     echo [AVISO] Arquivo .env nao encontrado.
     echo Crie o .env com as credenciais e configuracoes antes de executar o robo.
+    endlocal
+    pause
+    exit /b 1
 )
-echo Para ativar o ambiente depois, use:
-echo .venv\Scripts\activate
-echo Para executar a automacao, use:
-echo python main.py
+
+echo.
+echo Iniciando a automacao (Ctrl+C para parar)...
+python main.py
 
 endlocal
 pause
