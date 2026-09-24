@@ -39,6 +39,11 @@ LOOP_WAIT_S  = int(os.getenv("LOOP_WAIT_S", "60"))
 CLASSE_MOV_DEPOSITO = "Movimentação de depositos"
 DEPOSITO            = "Almox central"
 
+# Para esta matrícula o campo do requisitante é preenchido com o nome, não
+# com a matrícula (pedido do usuário 2026-09-24).
+MATRICULA_COM_NOME_NO_ERP = "4607"
+NOME_NO_ERP               = "Alana de Oliveira Cunha"
+
 OUTPUT_DIR = Path("output/screenshots")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -280,6 +285,8 @@ def inserir_requisicao(page: Page, rec: dict) -> str:
     """
     classe  = rec["classe_req"]
     matr    = rec["matricula"]
+    if str(matr).strip() == MATRICULA_COM_NOME_NO_ERP:
+        matr = NOME_NO_ERP
     cc      = rec["cc"]
     recurso = rec["item"]
     qtd     = str(int(rec["quantidade"]) if rec["quantidade"] == int(rec["quantidade"]) else rec["quantidade"])
