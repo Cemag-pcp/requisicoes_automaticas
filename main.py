@@ -39,6 +39,10 @@ LOOP_WAIT_S  = int(os.getenv("LOOP_WAIT_S", "60"))
 CLASSE_MOV_DEPOSITO = "Movimentação de depositos"
 DEPOSITO            = "Almox central"
 
+# Pausa entre o insert (chave capturada) e a digitação do primeiro campo
+# (Classe) de cada requisição — pedido do usuário 2026-09-24.
+PAUSA_ANTES_DE_PREENCHER_S = 20
+
 # Para esta matrícula o campo do requisitante é preenchido com outro valor
 # (07876932355), não com a matrícula (pedido do usuário 2026-09-24).
 MATRICULA_SUBSTITUIDA = "4607"
@@ -348,6 +352,9 @@ def inserir_requisicao(page: Page, rec: dict) -> str:
     # ── 4. Preencher campos — Tab avança entre campos ──────────────────────
     # Após insert o ERP foca Classe diretamente (CHAVE readOnly é pulado).
     # Cada campo lookup precisa de tempo para o ERP resolver via rede.
+
+    log.info(f"  → Aguardando {PAUSA_ANTES_DE_PREENCHER_S}s antes de preencher o primeiro campo...")
+    page.wait_for_timeout(PAUSA_ANTES_DE_PREENCHER_S * 1000)
 
     page.keyboard.type(classe)
     page.keyboard.press("Tab")
