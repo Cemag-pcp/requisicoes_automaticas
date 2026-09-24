@@ -22,19 +22,22 @@ if %errorlevel%==0 (
 if not defined PYTHON_CMD (
     echo [ERRO] Python nao encontrado no PATH.
     echo Instale o Python 3 e rode este script novamente.
+    pause
     exit /b 1
 )
 
 if not exist "requirements.txt" (
     echo [ERRO] Arquivo requirements.txt nao encontrado na pasta do projeto.
+    pause
     exit /b 1
 )
 
 echo [1/5] Criando ambiente virtual...
-if not exist ".venv\Scripts\python.exe" (
+if not exist ".venv\Scripts\activate.bat" (
     call %PYTHON_CMD% -m venv .venv
     if errorlevel 1 (
         echo [ERRO] Falha ao criar o ambiente virtual.
+        pause
         exit /b 1
     )
 ) else (
@@ -45,6 +48,7 @@ echo [2/6] Ativando ambiente virtual...
 call ".venv\Scripts\activate.bat"
 if errorlevel 1 (
     echo [ERRO] Falha ao ativar o ambiente virtual.
+    pause
     exit /b 1
 )
 
@@ -52,6 +56,7 @@ echo [3/6] Atualizando pip...
 python -m pip install --upgrade pip
 if errorlevel 1 (
     echo [ERRO] Falha ao atualizar o pip.
+    pause
     exit /b 1
 )
 
@@ -59,6 +64,7 @@ echo [4/6] Instalando dependencias do requirements.txt...
 python -m pip install -r requirements.txt
 if errorlevel 1 (
     echo [ERRO] Falha ao instalar as dependencias.
+    pause
     exit /b 1
 )
 
@@ -70,6 +76,7 @@ echo [6/6] Instalando navegador do Playwright...
 python -m playwright install chromium
 if errorlevel 1 (
     echo [ERRO] Falha ao instalar o Chromium do Playwright.
+    pause
     exit /b 1
 )
 
@@ -85,3 +92,4 @@ echo Para executar a automacao, use:
 echo python main.py
 
 endlocal
+pause
