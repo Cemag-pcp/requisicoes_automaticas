@@ -856,6 +856,7 @@ Descoberto via linked list `field.nextField` a partir de campo conhecido.
 | C Custos Resultados | `CCUSTRES` | `cc.nome` |
 | Recurso | `RECURSO` | `i.codigo` |
 | Quantidade | `QUANTIDADE` | `sr.quantidade` |
+| Emissão | `EMISSAO` | `sr.data_solicitacao` (fuso America/Fortaleza, `DD/MM/YYYY`). O ERP pré-preenche com HOJE: chegar via Tab a partir de Quantidade (Quantidade → Observação → Emissão), `Ctrl+A` e digitar. Adicionado em nov/2026. |
 
 Campos `readOnly: true` **não devem** ser preenchidos via `updateCellValue` — o ERP ignora ou lança erro.
 

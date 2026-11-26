@@ -14,6 +14,7 @@ Fluxo por registro:
 """
 
 import os
+import re
 import time
 import logging
 import json
@@ -30,7 +31,10 @@ load_dotenv()
 # Configuração
 # ---------------------------------------------------------------------------
 
-ERP_URL      = os.getenv("INNOVARO_URL", "http://192.168.3.140/sistema")
+ERP_URL      = os.getenv("INNOVARO_URL", "http://192.168.3.140/sistema").strip()
+if "://" not in ERP_URL:
+    # Sem protocolo o Chrome recusa ("Cannot navigate to invalid URL").
+    ERP_URL = "http://" + ERP_URL
 ERP_USER     = os.getenv("INNOVARO_USERNAME", "user_almox")
 ERP_PASS     = os.getenv("INNOVARO_PASSWORD", "samuel05")
 SLOW_MO      = int(os.getenv("INNOVARO_SLOW_MO_MS", "250"))
@@ -57,6 +61,11 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# Logs também no Postgres (schema log_requisicao — ver log_bd.py e
+# sql/log_requisicao.sql). O arquivo acima continua como reserva.
+from log_bd import logbd, HandlerBD  # noqa: E402
+logging.getLogger().addHandler(HandlerBD(logbd))
+
 
 # ---------------------------------------------------------------------------
 # Banco de dados
@@ -73,7 +82,58 @@ def conectar_bd():
     )
 
 
-def buscar_pendentes(conn):
+class BancoDados:
+    """Guarda a conexão e reconecta quando ela cai — o robô roda 24h e o
+    servidor derruba conexões ociosas. Sem isso, um `marcar_ok` que falha
+    depois de um lançamento BEM-SUCEDIDO no ERP deixava o registro pendente
+    e ele era lançado de novo na rodada seguinte (requisição duplicada)."""
+
+    def __init__(self):
+        self.conn = conectar_bd()
+
+    def reconectar(self):
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+        self.conn = conectar_bd()
+        log.info("Reconectado ao banco.")
+
+    def executar(self, sql: str, params: tuple, tentativas: int = 3):
+        """UPDATE com commit, reconectando e repetindo se a conexão falhar."""
+        for tentativa in range(1, tentativas + 1):
+            try:
+                with self.conn.cursor() as cur:
+                    cur.execute(sql, params)
+                self.conn.commit()
+                return
+            except (psycopg2.OperationalError, psycopg2.InterfaceError) as exc:
+                log.warning(f"  → Banco indisponível (tentativa {tentativa}/{tentativas}): {exc}")
+                if tentativa == tentativas:
+                    raise
+                time.sleep(5)
+                try:
+                    self.reconectar()
+                except Exception as exc_conn:
+                    log.warning(f"  → Falha ao reconectar: {exc_conn}")
+
+
+class FalhaCriticaBanco(Exception):
+    """Registro foi (ou pode ter sido) gravado no ERP, mas não deu pra
+    registrar isso no banco. Continuar rodando lançaria de novo -> o robô
+    PARA para alguém conferir."""
+
+
+class ErroAposGravar(RuntimeError):
+    """Falha DEPOIS de confirmar o 'Gravar' (clique em 'Sim'): o ERP pode
+    ter gravado a requisição. NÃO pode ser repetida automaticamente."""
+
+    def __init__(self, chave: str, mensagem: str):
+        super().__init__(mensagem)
+        self.chave = chave
+
+
+def buscar_pendentes(bd: "BancoDados"):
     sql = """
         SELECT
             sr.id,
@@ -82,42 +142,66 @@ def buscar_pendentes(conn):
             cr.nome                             AS classe_req,
             f.matricula                         AS matricula,
             cc.nome                             AS cc,
-            sr.chave_innovaro
+            sr.chave_innovaro,
+            to_char(sr.data_solicitacao AT TIME ZONE 'America/Fortaleza', 'DD/MM/YYYY')
+                                                AS data_emissao
         FROM apontamento_v2.solicitacao_almox_solicitacaorequisicao sr
         JOIN apontamento_v2.cadastro_almox_itenssolicitacao    i  ON i.id  = sr.item_id
         JOIN apontamento_v2.cadastro_almox_classerequisicao    cr ON cr.id = sr.classe_requisicao_id
         JOIN apontamento_v2.cadastro_almox_funcionario         f  ON f.id  = sr.funcionario_id
         JOIN apontamento_v2.cadastro_almox_cc                  cc ON cc.id = sr.cc_id
         WHERE (sr.rpa IS NULL OR sr.rpa != 'OK')
+          AND (sr.rpa IS NULL OR sr.rpa NOT LIKE 'VERIFICAR%%')
           AND sr.data_entrega IS NOT NULL
         ORDER BY sr.id
     """
-    with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-        cur.execute(sql)
-        return cur.fetchall()
+    for tentativa in (1, 2):
+        try:
+            with bd.conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+                cur.execute(sql)
+                linhas = cur.fetchall()
+            bd.conn.commit()  # não deixar a conexão 'idle in transaction'
+            return linhas
+        except (psycopg2.OperationalError, psycopg2.InterfaceError) as exc:
+            if tentativa == 2:
+                raise
+            log.warning(f"Banco indisponível ao buscar pendentes ({exc}) — reconectando...")
+            bd.reconectar()
 
 
-def marcar_ok(conn, sr_id: int, chave_innovaro: str):
+def marcar_ok(bd: BancoDados, sr_id: int, chave_innovaro: str):
     sql = """
         UPDATE apontamento_v2.solicitacao_almox_solicitacaorequisicao
         SET rpa = 'OK', chave_innovaro = %s
         WHERE id = %s
     """
-    with conn.cursor() as cur:
-        cur.execute(sql, (chave_innovaro, sr_id))
-    conn.commit()
+    bd.executar(sql, (chave_innovaro, sr_id))
 
 
-def marcar_erro(conn, sr_id: int, mensagem: str):
+def marcar_erro(bd: BancoDados, sr_id: int, mensagem: str):
+    """Erro ANTES de gravar (ou recusa explícita do ERP): nada foi gravado,
+    o registro volta pra fila e é tentado de novo na próxima rodada."""
     msg = mensagem[:490] if len(mensagem) > 490 else mensagem
     sql = """
         UPDATE apontamento_v2.solicitacao_almox_solicitacaorequisicao
         SET rpa = %s
         WHERE id = %s
     """
-    with conn.cursor() as cur:
-        cur.execute(sql, (f"ERRO: {msg}", sr_id))
-    conn.commit()
+    bd.executar(sql, (f"ERRO: {msg}", sr_id))
+
+
+def marcar_verificar(bd: BancoDados, sr_id: int, chave_innovaro: str, mensagem: str):
+    """Falha DEPOIS de confirmar o 'Gravar': o ERP pode ter gravado. Marca
+    'VERIFICAR: ...' (fica FORA da fila — `buscar_pendentes` ignora) e
+    guarda a chave pra alguém conferir no Innovaro. Para reprocessar, limpar
+    o campo rpa (NULL) manualmente."""
+    msg = mensagem[:480] if len(mensagem) > 480 else mensagem
+    sql = """
+        UPDATE apontamento_v2.solicitacao_almox_solicitacaorequisicao
+        SET rpa = %s, chave_innovaro = %s
+        WHERE id = %s
+    """
+    bd.executar(sql, (f"VERIFICAR: {msg}", chave_innovaro, sr_id))
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +362,31 @@ def reabrir_requisicoes(page: Page):
 # Playwright — fluxo de inserção de uma requisição
 # ---------------------------------------------------------------------------
 
+def _conferir_emissao(page: Page, esperado: str):
+    """Relê o campo Emissão (iframe da tela) e confirma que ficou com a data
+    pedida. Diferente -> erro ANTES do Gravar (seguro: volta pra fila). Se
+    não achar o input pra conferir, só avisa no log."""
+    valor = page.evaluate("""() => {
+        const doc = document.querySelector('iframe')?.contentDocument;
+        const el = doc?.querySelector('[name="EMISSAO"]');
+        return el ? (el.value ?? el.innerText ?? '').trim() : null;
+    }""")
+    if valor is None:
+        log.warning(f"  → Emissão digitada ({esperado}), mas não achei o campo EMISSAO pra conferir.")
+        return
+    log.info(f"  → Emissão: {valor!r} (esperado {esperado})")
+
+    def _dma(texto: str):
+        partes = re.findall(r"\d+", texto)
+        if len(partes) < 3:
+            return None
+        d, m, a = (int(p) for p in partes[:3])
+        return d, m, a % 100  # aceita ano com 2 ou 4 dígitos
+
+    if _dma(valor) != _dma(esperado):
+        raise RuntimeError(f"Campo Emissão ficou {valor!r} em vez de {esperado!r}.")
+
+
 def inserir_requisicao(page: Page, rec: dict) -> str:
     """
     Insere um registro na grdRequisicoes, aprova, baixa e grava.
@@ -294,6 +403,7 @@ def inserir_requisicao(page: Page, rec: dict) -> str:
     log.info(f"  → Inserindo: recurso={recurso}, qtd={qtd}, classe={classe}, req={matr}")
 
     # ── 1. Fechar menu se aberto e focar iframe ────────────────────────────
+    logbd.etapa("preparar")
     fechar_menu = page.get_by_role("button", name="Fechar menu", exact=True)
     if fechar_menu.is_visible():
         fechar_menu.click()
@@ -314,6 +424,7 @@ def inserir_requisicao(page: Page, rec: dict) -> str:
     log.info("  → Grid em FORM_VIEW, iniciando insert...")
 
     # ── 3. Insert + captura de CHAVE via rede ─────────────────────────────
+    logbd.etapa("insert")
     chave_capturada: list[str] = []
 
     def _on_response_insert(response):
@@ -344,6 +455,8 @@ def inserir_requisicao(page: Page, rec: dict) -> str:
         raise RuntimeError("CHAVE não capturada na resposta de rede após insert.")
     print(f"[CHAVE] {chave}")
     log.info(f"  → Chave capturada via rede: {chave}")
+    logbd.registrar_chave(chave)
+    logbd.etapa("preencher")
 
     # ── 4. Preencher campos — Tab avança entre campos ──────────────────────
     # Após insert o ERP foca Classe diretamente (CHAVE readOnly é pulado).
@@ -371,10 +484,26 @@ def inserir_requisicao(page: Page, rec: dict) -> str:
     page.wait_for_timeout(300)
 
     page.keyboard.type(qtd)
-    page.keyboard.press("Tab")
+    page.keyboard.press("Tab")  # Quantidade -> Observação
     aguardar_erp_pronto(page, wait_ms=800)
 
+    # Emissão = data em que o usuário solicitou (sr.data_solicitacao).
+    # Ordem dos campos: QUANTIDADE -> OBSERVACAO -> EMISSAO -> EMISSAOH.
+    # O ERP pré-preenche Emissão com a data de hoje — por isso Ctrl+A antes.
+    data_emissao = rec.get("data_emissao")
+    if data_emissao:
+        logbd.etapa("emissao")
+        page.keyboard.press("Tab")  # Observação (vazia) -> Emissão
+        page.wait_for_timeout(300)
+        page.keyboard.press("Control+A")
+        page.keyboard.type(data_emissao)
+        page.keyboard.press("Tab")
+        aguardar_erp_pronto(page, wait_ms=800)
+        _conferir_emissao(page, data_emissao)
+        logbd.etapa("preencher")
+
     # ── 5. Confirmar edição ────────────────────────────────────────────────
+    logbd.etapa("confirmar_edicao")
     confirmou = page.evaluate("""() => {
         const iframeDoc = document.querySelector('iframe')?.contentDocument;
         const btn = iframeDoc?.querySelector('[aria-label="Confirmar edição"]');
@@ -389,6 +518,7 @@ def inserir_requisicao(page: Page, rec: dict) -> str:
     _aguardar_sem_insercao(page)
 
     # ── 6. Alternar para TABLE_VIEW ────────────────────────────────────────
+    logbd.etapa("selecionar_linha")
     page.evaluate("""() => {
         const grid = window.Environment.getInstance().currentProcess.getGrid('grdRequisicoes');
         if (grid.inFormView) grid.toggleView();
@@ -401,11 +531,13 @@ def inserir_requisicao(page: Page, rec: dict) -> str:
     aguardar_erp_pronto(page, wait_ms=500)
 
     # ── 8. Aprovar — aguarda modal de confirmação ─────────────────────────
+    logbd.etapa("aprovar")
     page.mouse.click(172, 131)
     page.wait_for_selector('[role="dialog"]', timeout=15000)
     _fechar_modal(page)
 
     # ── 9. Baixar — aguarda o botão "Continuar" do form ficar visível ────────
+    logbd.etapa("baixar")
     page.mouse.click(321, 131)
     continuar = page.locator("text=Continuar").first
     continuar.wait_for(state="visible", timeout=15000)
@@ -428,6 +560,7 @@ def inserir_requisicao(page: Page, rec: dict) -> str:
     aguardar_erp_pronto(page, wait_ms=1000)
 
     # ── 10. Gravar — aguarda botão ficar habilitado ───────────────────────
+    logbd.etapa("gravar")
     page.wait_for_function("""() => {
         const btns = [...document.querySelectorAll('button')];
         const g = btns.find(b => b.innerText?.trim() === 'Gravar');
@@ -439,13 +572,37 @@ def inserir_requisicao(page: Page, rec: dict) -> str:
     sim = page.get_by_role("dialog").get_by_role("button", name="Sim")
     sim.wait_for(state="visible", timeout=8000)
     sim.click()
+    logbd.etapa("pos_gravar")
+    log.info("  → 'Sim' do Gravar clicado — aguardando resultado...")
 
-    # Aguarda o dialog de confirmação fechar antes de buscar o modal de resultado
-    page.wait_for_selector('[role="dialog"]', state="hidden", timeout=10000)
+    # ── PONTO SEM VOLTA ─────────────────────────────────────────────────────
+    # A partir daqui o ERP pode ter gravado. Qualquer falha que NÃO seja uma
+    # recusa explícita do ERP vira ErroAposGravar -> 'VERIFICAR', nunca
+    # reprocessada automaticamente (era a causa das requisições duplicadas:
+    # timeout/modal de progresso lido como erro -> 'ERRO' -> lançada de novo).
+    try:
+        # o próprio modal "Deseja realmente gravar?" precisa sumir antes,
+        # senão ele seria lido como "nova confirmação"
+        sim.wait_for(state="hidden", timeout=15000)
+        modal = _aguardar_resultado_gravacao(page)
+    except Exception as exc:
+        raise ErroAposGravar(chave, f"Sem resultado claro após gravar ({exc})") from exc
+    if modal is not None:
+        _avaliar_e_fechar_modal_pos_gravar(page, modal, chave)  # sempre levanta
 
-    # Aguarda modal de resultado (sucesso ou erro)
-    page.wait_for_selector('[role="dialog"]', timeout=15000)
-    _verificar_e_fechar_modal_pos_gravar(page)
+    # Silêncio NÃO basta (id 19640, 26/11: sem modal nenhum e NÃO gravou —
+    # tela idêntica à de um erro de saldo, com 'Gravar' ainda habilitado).
+    # Prova positiva: depois de gravar, o 'Gravar' fica desabilitado (sem
+    # alterações pendentes). Ainda habilitado -> não dá pra afirmar -> VERIFICAR.
+    gravar_habilitado = _botao_gravar_habilitado(page)
+    log.info(f"  → Nenhum modal em {SILENCIO_SUCESSO_MS // 1000}s após gravar; "
+             f"botão Gravar habilitado={gravar_habilitado}")
+    if gravar_habilitado is not False:
+        raise ErroAposGravar(
+            chave,
+            "Sem modal após gravar, mas o botão Gravar continua habilitado (alterações pendentes) "
+            "— provavelmente NÃO gravou",
+        )
 
     log.info(f"  ✓ Fluxo concluído — chave: {chave}")
     return chave
@@ -465,18 +622,93 @@ def _fechar_modal(page: Page):
         pass
 
 
-def _verificar_e_fechar_modal_pos_gravar(page: Page):
-    """
-    Lê o texto do modal pós-gravação, fecha e levanta RuntimeError se for erro.
-    """
-    dialog = page.get_by_role("dialog")
-    texto = ""
-    try:
-        texto = dialog.inner_text().strip()
-    except Exception:
-        pass
-    log.info(f"  → Texto do modal pós-gravar: '{texto}'")
+_RE_PROGRESSO = re.compile(r"^\s*$|aguarde|gravando|carregando|processando|^\s*\d+\s*%\s*$", re.IGNORECASE)
 
+
+def _dialogs_visiveis(page: Page) -> list[dict]:
+    """[{texto, tem_sim}] de cada modal visível."""
+    return page.evaluate("""() => [...document.querySelectorAll('[role="dialog"], [role="alertdialog"]')]
+        .filter(d => { const r = d.getBoundingClientRect(); return r.width > 0 && r.height > 0; })
+        .map(d => ({
+            texto: (d.innerText || '').trim(),
+            tem_sim: [...d.querySelectorAll('button')].some(b =>
+                (b.getAttribute('aria-label') || b.innerText || '').trim() === 'Sim'),
+        }))""")
+
+
+def _erp_ocupado(page: Page) -> bool:
+    """Mesma checagem de `aguardar_erp_pronto`, numa passada só."""
+    return page.evaluate("""() => {
+        const doc = document.querySelector('iframe')?.contentDocument;
+        if (!doc) return false;
+        const body = doc.body?.innerText || '';
+        return /Explodindo|Gravando|Criando n[ií]vel|Carregando|Processando/i.test(body) ||
+               !!doc.querySelector('#progressMessageBox, #statusMessageBox, [role="progressbar"]') ||
+               !!doc.querySelector('.wf-progress-dialog__content');
+    }""")
+
+
+SILENCIO_SUCESSO_MS = 5000
+
+
+def _botao_gravar_habilitado(page: Page) -> bool | None:
+    """True/False = estado do botão 'Gravar' da barra; None = não achou."""
+    return page.evaluate("""() => {
+        const g = [...document.querySelectorAll('button')].find(b => b.innerText?.trim() === 'Gravar');
+        return g ? !g.disabled : null;
+    }""")
+
+
+def _aguardar_resultado_gravacao(page: Page, timeout_ms: int = 120000,
+                                 silencio_ms: int = SILENCIO_SUCESSO_MS) -> dict | None:
+    """Depois do 'Sim' do Gravar o ERP mostra modais de PROGRESSO
+    ('Gravando requisições...', 'Aguarde...', '0%'). No SUCESSO ele NÃO
+    mostra modal nenhum (confirmado pelo usuário, nov/2026) — só mostra
+    modal quando dá erro. Então:
+    - aparece modal que não é de progresso -> devolve ele (erro/dúvida);
+    - fica `silencio_ms` seguidos SEM modal nenhum e sem o ERP ocupado
+      -> devolve None (= sucesso);
+    - nem um nem outro em `timeout_ms` -> TimeoutError (vira VERIFICAR)."""
+    inicio = time.time()
+    silencio_desde = None
+    vistos: set[str] = set()
+    while (time.time() - inicio) * 1000 < timeout_ms:
+        modais = _dialogs_visiveis(page)
+        for modal in modais:
+            # registra TODO modal visto (inclusive progresso) — evidência
+            # pra casos como o id 19640 (sem modal, mas não gravou)
+            if modal["texto"] not in vistos:
+                vistos.add(modal["texto"])
+                log.info(f"  → Modal visto após gravar ({time.time() - inicio:.1f}s): {modal['texto'][:200]!r}")
+        for modal in modais:
+            if not _RE_PROGRESSO.search(modal["texto"]):
+                return modal
+        if modais or _erp_ocupado(page):
+            silencio_desde = None
+        elif silencio_desde is None:
+            silencio_desde = time.time()
+        elif (time.time() - silencio_desde) * 1000 >= silencio_ms:
+            return None
+        page.wait_for_timeout(300)
+    raise TimeoutError(f"gravação não terminou em {timeout_ms // 1000}s (progresso não sumiu)")
+
+
+def _avaliar_e_fechar_modal_pos_gravar(page: Page, modal: dict, chave: str):
+    """Classifica o modal que apareceu depois do Gravar. Como o ERP NÃO
+    mostra modal no sucesso, nenhum modal aqui é sucesso:
+    - recusa EXPLÍCITA do ERP (modal de 'Erro', ex.: 'Saldo insuficiente')
+      -> RuntimeError comum: nada foi gravado, pode tentar de novo depois;
+    - nova pergunta de confirmação (tem botão 'Sim', ex.: 'custo zero...
+      Deseja realmente gravar?') -> ErroAposGravar (não responde sozinho);
+    - qualquer outro texto -> ErroAposGravar (inesperado: conferir)."""
+    texto = modal["texto"]
+    log.info(f"  → Texto do modal pós-gravar: {texto!r}")
+    logbd.registrar_texto_modal(texto)
+
+    if modal["tem_sim"]:
+        raise ErroAposGravar(chave, f"ERP pediu nova confirmação após gravar: {texto}")
+
+    dialog = page.get_by_role("dialog")
     try:
         btn = dialog.get_by_role("button", name="Fechar")
         if btn.count():
@@ -487,9 +719,10 @@ def _verificar_e_fechar_modal_pos_gravar(page: Page):
     except Exception:
         pass
 
-    palavras_erro = ["erro", "falha", "não foi", "nao foi", "impossível", "impossivel", "inválid", "invalido"]
-    if any(p in texto.lower() for p in palavras_erro):
+    texto_min = texto.lower()
+    if texto_min.startswith("erro") or "erro:" in texto_min:
         raise RuntimeError(f"ERP retornou erro após gravar: {texto}")
+    raise ErroAposGravar(chave, f"Modal inesperado após gravar: {texto}")
 
 
 # ---------------------------------------------------------------------------
@@ -505,16 +738,25 @@ MOCK_REC = {
     "matricula": "4357",
     "cc": "2310",
     "chave_innovaro": None,
+    "data_emissao": None,
 }
 
 
-def ciclo(page: Page, conn):
+def _screenshot_seguro(page: Page, nome: str) -> str | None:
+    try:
+        return str(capturar_screenshot(page, nome))
+    except Exception as exc:
+        log.warning(f"  → Não consegui tirar screenshot ({exc})")
+        return None
+
+
+def ciclo(page: Page, bd: BancoDados):
     """Busca pendentes e processa um a um."""
     if MOCK_TEST:
         pendentes = [MOCK_REC]
         log.info("MOCK_TEST ativo — usando registro de teste.")
     else:
-        pendentes = buscar_pendentes(conn)
+        pendentes = buscar_pendentes(bd)
     if not pendentes:
         log.info("Nenhum registro pendente.")
         return
@@ -523,18 +765,48 @@ def ciclo(page: Page, conn):
 
     for rec in pendentes:
         sr_id = rec["id"]
+        logbd.abrir_tentativa(dict(rec))
         log.info(f"Processando id={sr_id} | recurso={rec['item']}")
         try:
-            chave = inserir_requisicao(page, rec)
-            if not MOCK_TEST:
-                marcar_ok(conn, sr_id, chave)
-            log.info(f"  ✓ id={sr_id} gravado com chave={chave}")
-        except Exception as exc:
-            log.error(f"  ✗ Erro no id={sr_id}: {exc}", exc_info=True)
-            capturar_screenshot(page, f"erro_id{sr_id}")
-            if not MOCK_TEST:
-                marcar_erro(conn, sr_id, str(exc))
+            try:
+                chave = inserir_requisicao(page, rec)
+            except ErroAposGravar as exc:
+                log.error(f"  ⚠ id={sr_id} PODE ter sido gravado (chave={exc.chave}) — marcado VERIFICAR: {exc}")
+                screenshot = _screenshot_seguro(page, f"verificar_id{sr_id}")
+                logbd.fechar_tentativa("VERIFICAR", str(exc), screenshot, exc.chave)
+                if not MOCK_TEST:
+                    try:
+                        marcar_verificar(bd, sr_id, exc.chave, str(exc))
+                    except Exception as exc_bd:
+                        raise FalhaCriticaBanco(
+                            f"id={sr_id} pode ter sido gravado (chave={exc.chave}), mas não consegui "
+                            f"marcar VERIFICAR no banco: {exc_bd}"
+                        ) from exc_bd
+            except Exception as exc:
+                # Falha ANTES de confirmar o Gravar (ou recusa explícita do
+                # ERP): nada gravado, volta pra fila.
+                log.error(f"  ✗ Erro no id={sr_id}: {exc}", exc_info=True)
+                screenshot = _screenshot_seguro(page, f"erro_id{sr_id}")
+                logbd.fechar_tentativa("ERRO", str(exc), screenshot)
+                if not MOCK_TEST:
+                    try:
+                        marcar_erro(bd, sr_id, str(exc))
+                    except Exception as exc_bd:
+                        log.error(f"  → Não consegui marcar ERRO no banco (id={sr_id}): {exc_bd}")
+            else:
+                log.info(f"  ✓ id={sr_id} gravado com chave={chave}")
+                logbd.fechar_tentativa("OK", chave=chave)
+                if not MOCK_TEST:
+                    try:
+                        marcar_ok(bd, sr_id, chave)
+                    except Exception as exc_bd:
+                        raise FalhaCriticaBanco(
+                            f"id={sr_id} FOI gravado no ERP (chave={chave}), mas não consegui marcar OK "
+                            f"no banco: {exc_bd}"
+                        ) from exc_bd
         finally:
+            if logbd.tentativa_id is not None:  # saiu por exceção inesperada (ex.: KeyboardInterrupt)
+                logbd.fechar_tentativa(None, "Tentativa interrompida")
             # Sempre fechar a aba e reabrir pelo menu, independente do que aconteceu
             try:
                 reabrir_requisicoes(page)
@@ -549,7 +821,25 @@ def ciclo(page: Page, conn):
 
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    logbd.iniciar_execucao()
     log.info("Iniciando automação de requisições...")
+    status_fim, motivo_fim = "PARADO_ERRO", None
+    try:
+        _executar_robo()
+        status_fim = "ENCERRADO"
+    except KeyboardInterrupt:
+        status_fim = "INTERROMPIDO"
+    except FalhaCriticaBanco as exc:
+        motivo_fim = f"FalhaCriticaBanco: {exc}"
+    except BaseException as exc:
+        motivo_fim = f"{type(exc).__name__}: {exc}"
+        log.critical(f"Robô parou por erro inesperado: {exc}", exc_info=True)
+        raise
+    finally:
+        logbd.finalizar_execucao(status_fim, motivo_fim)
+
+
+def _executar_robo():
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -560,7 +850,7 @@ def main():
         context = browser.new_context(viewport={"width": 1600, "height": 900})
         page = context.new_page()
 
-        conn = conectar_bd()
+        bd = BancoDados()
         log.info("Conexão com banco estabelecida.")
 
         try:
@@ -569,10 +859,16 @@ def main():
 
             while True:
                 try:
-                    ciclo(page, conn)
+                    ciclo(page, bd)
+                except FalhaCriticaBanco as exc:
+                    log.critical(
+                        f"PARANDO O ROBÔ para evitar requisição duplicada: {exc}. "
+                        "Atualize o registro manualmente no banco antes de reiniciar."
+                    )
+                    raise
                 except Exception as exc:
                     log.error(f"Erro no ciclo: {exc}", exc_info=True)
-                    capturar_screenshot(page, "erro_ciclo")
+                    _screenshot_seguro(page, "erro_ciclo")
                     try:
                         reabrir_requisicoes(page)
                     except Exception:
@@ -584,8 +880,12 @@ def main():
 
         except KeyboardInterrupt:
             log.info("Automação encerrada pelo usuário.")
+            raise
         finally:
-            conn.close()
+            try:
+                bd.conn.close()
+            except Exception:
+                pass
             browser.close()
 
 
