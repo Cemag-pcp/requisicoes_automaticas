@@ -20,7 +20,6 @@ import logging
 import json
 import psycopg2
 import psycopg2.extras
-from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, Page, TimeoutError as PlaywrightTimeout
@@ -48,7 +47,7 @@ DEPOSITO            = "Almox central"
 MATRICULA_SUBSTITUIDA = "4607"
 VALOR_SUBSTITUTO      = "07876932355"
 
-OUTPUT_DIR = Path("output/screenshots")
+OUTPUT_DIR = Path("output")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
@@ -207,14 +206,6 @@ def marcar_verificar(bd: BancoDados, sr_id: int, chave_innovaro: str, mensagem: 
 # ---------------------------------------------------------------------------
 # Playwright — utilitários
 # ---------------------------------------------------------------------------
-
-def capturar_screenshot(page: Page, nome: str) -> Path:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    caminho = OUTPUT_DIR / f"{ts}_{nome}.png"
-    page.screenshot(path=str(caminho), full_page=True)
-    return caminho
-
 
 def aguardar_erp_pronto(page: Page, wait_ms: int = 500, timeout_ms: int = 120000):
     """Aguarda o ERP sair de overlays de processamento."""
@@ -742,14 +733,6 @@ MOCK_REC = {
 }
 
 
-def _screenshot_seguro(page: Page, nome: str) -> str | None:
-    try:
-        return str(capturar_screenshot(page, nome))
-    except Exception as exc:
-        log.warning(f"  → Não consegui tirar screenshot ({exc})")
-        return None
-
-
 def ciclo(page: Page, bd: BancoDados):
     """Busca pendentes e processa um a um."""
     if MOCK_TEST:
@@ -772,8 +755,7 @@ def ciclo(page: Page, bd: BancoDados):
                 chave = inserir_requisicao(page, rec)
             except ErroAposGravar as exc:
                 log.error(f"  ⚠ id={sr_id} PODE ter sido gravado (chave={exc.chave}) — marcado VERIFICAR: {exc}")
-                screenshot = _screenshot_seguro(page, f"verificar_id{sr_id}")
-                logbd.fechar_tentativa("VERIFICAR", str(exc), screenshot, exc.chave)
+                logbd.fechar_tentativa("VERIFICAR", str(exc), chave=exc.chave)
                 if not MOCK_TEST:
                     try:
                         marcar_verificar(bd, sr_id, exc.chave, str(exc))
@@ -786,8 +768,7 @@ def ciclo(page: Page, bd: BancoDados):
                 # Falha ANTES de confirmar o Gravar (ou recusa explícita do
                 # ERP): nada gravado, volta pra fila.
                 log.error(f"  ✗ Erro no id={sr_id}: {exc}", exc_info=True)
-                screenshot = _screenshot_seguro(page, f"erro_id{sr_id}")
-                logbd.fechar_tentativa("ERRO", str(exc), screenshot)
+                logbd.fechar_tentativa("ERRO", str(exc))
                 if not MOCK_TEST:
                     try:
                         marcar_erro(bd, sr_id, str(exc))
@@ -868,7 +849,6 @@ def _executar_robo():
                     raise
                 except Exception as exc:
                     log.error(f"Erro no ciclo: {exc}", exc_info=True)
-                    _screenshot_seguro(page, "erro_ciclo")
                     try:
                         reabrir_requisicoes(page)
                     except Exception:

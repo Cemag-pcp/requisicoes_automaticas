@@ -70,7 +70,6 @@ if errorlevel 1 (
 
 echo [5/6] Preparando pastas locais...
 if not exist "output" mkdir output
-if not exist "output\screenshots" mkdir output\screenshots
 
 echo [6/6] Instalando navegador do Playwright...
 python -m playwright install chromium
