@@ -579,7 +579,10 @@ def inserir_requisicao(page: Page, rec: dict) -> str:
     except Exception as exc:
         raise ErroAposGravar(chave, f"Sem resultado claro após gravar ({exc})") from exc
     if modal is not None:
-        _avaliar_e_fechar_modal_pos_gravar(page, modal, chave)  # sempre levanta
+        # levanta em erro/dúvida; retorna normalmente só no modal de sucesso
+        _avaliar_e_fechar_modal_pos_gravar(page, modal, chave)
+        log.info(f"  ✓ ERP confirmou: {modal['texto'].splitlines()[0]!r} — chave: {chave}")
+        return chave
 
     # Silêncio NÃO basta (id 19640, 26/11: sem modal nenhum e NÃO gravou —
     # tela idêntica à de um erro de saldo, com 'Gravar' ainda habilitado).
@@ -653,10 +656,9 @@ def _botao_gravar_habilitado(page: Page) -> bool | None:
 def _aguardar_resultado_gravacao(page: Page, timeout_ms: int = 120000,
                                  silencio_ms: int = SILENCIO_SUCESSO_MS) -> dict | None:
     """Depois do 'Sim' do Gravar o ERP mostra modais de PROGRESSO
-    ('Gravando requisições...', 'Aguarde...', '0%'). No SUCESSO ele NÃO
-    mostra modal nenhum (confirmado pelo usuário, nov/2026) — só mostra
-    modal quando dá erro. Então:
-    - aparece modal que não é de progresso -> devolve ele (erro/dúvida);
+    ('Gravando requisições...', 'Aguarde...', '0%') e depois o modal de
+    resultado — 'Requisições gravadas com sucesso!' ou 'Erro ...'. Então:
+    - aparece modal que não é de progresso -> devolve ele (sucesso/erro/dúvida);
     - fica `silencio_ms` seguidos SEM modal nenhum e sem o ERP ocupado
       -> devolve None (= sucesso);
     - nem um nem outro em `timeout_ms` -> TimeoutError (vira VERIFICAR)."""
@@ -685,8 +687,8 @@ def _aguardar_resultado_gravacao(page: Page, timeout_ms: int = 120000,
 
 
 def _avaliar_e_fechar_modal_pos_gravar(page: Page, modal: dict, chave: str):
-    """Classifica o modal que apareceu depois do Gravar. Como o ERP NÃO
-    mostra modal no sucesso, nenhum modal aqui é sucesso:
+    """Classifica o modal que apareceu depois do Gravar:
+    - 'Requisições gravadas com sucesso!' -> retorna normalmente (OK);
     - recusa EXPLÍCITA do ERP (modal de 'Erro', ex.: 'Saldo insuficiente')
       -> RuntimeError comum: nada foi gravado, pode tentar de novo depois;
     - nova pergunta de confirmação (tem botão 'Sim', ex.: 'custo zero...
@@ -713,7 +715,14 @@ def _avaliar_e_fechar_modal_pos_gravar(page: Page, modal: dict, chave: str):
     texto_min = texto.lower()
     if texto_min.startswith("erro") or "erro:" in texto_min:
         raise RuntimeError(f"ERP retornou erro após gravar: {texto}")
+    if _RE_SUCESSO.search(texto):
+        return  # 'Requisições gravadas com sucesso!' -> OK
     raise ErroAposGravar(chave, f"Modal inesperado após gravar: {texto}")
+
+
+# Confirmado ao vivo em 26/11/2026 (id 20297, chave 107292649): no sucesso o
+# ERP MOSTRA o modal 'Requisições gravadas com sucesso!' (com botão Fechar).
+_RE_SUCESSO = re.compile(r"gravad[ao]s?\s+com\s+sucesso", re.IGNORECASE)
 
 
 # ---------------------------------------------------------------------------
